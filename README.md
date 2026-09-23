@@ -19,6 +19,5 @@ building-system logic and Roblox development experience.
 
 ## Author
 
-Leonel
-
+Leonel Lilledal
 Roblox Lua Developer
