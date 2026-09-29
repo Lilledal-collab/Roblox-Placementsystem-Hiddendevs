@@ -42,5 +42,3 @@ the controller.
 
 Trove by Stephen Leitnick / Sleitnick RbxUtil is used for
 connection and instance lifetime management.
-
-## This is my third time trying to get this approved.
