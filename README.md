@@ -27,7 +27,7 @@ Left Click - Place / delete
 
 ## Demo
 
-![Building System Demo](ezgif.com-video-to-gif-converter.gif)
+![Building System Demo](demo.gif)
 
 ## Structure
 
