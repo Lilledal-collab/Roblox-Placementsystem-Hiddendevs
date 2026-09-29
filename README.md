@@ -1,23 +1,40 @@
-# Roblox Building System
+# Roblox Building / Placement System
 
-A grid-based building and placement system made in Luau.
+A client-side building system made in Luau for my HiddenDevs
+Luau Scripter application.
 
 ## Features
 
-- Grid snapping
-- Object preview
-- Object rotation
-- Object placement
+- Grid-based placement
+- 90° rotation
+- Multiple block templates
+- Collision detection
+- Placement preview
 - Delete mode
-- Placement validation
-- Clean and modular structure
+- Build range
+- Smooth preview movement
+- CollectionService-based ownership checks
+- CFrame-based placement calculations
 
-## About
+## Controls
 
-This project was made to demonstrate my Luau scripting,
-building-system logic and Roblox development experience.
+Q - Start / cancel placement
+F - Cycle blocks
+R - Rotate
+G - Change grid size
+X - Toggle delete mode
+Left Click - Place / delete
 
-## Author
+## Structure
 
-Leonel Lilledal
-Roblox Lua Developer
+PlacementController.luau contains the main placement system,
+including raycasting, CFrame calculations, grid snapping,
+collision validation, preview handling and deletion.
+
+Placement.luau is the small startup script that requires
+the controller.
+
+## Dependency
+
+Trove by Stephen Leitnick / Sleitnick RbxUtil is used for
+connection and instance lifetime management.
