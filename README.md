@@ -25,6 +25,10 @@ G - Change grid size
 X - Toggle delete mode
 Left Click - Place / delete
 
+## Demo
+
+![Building System Demo](ezgif.com-video-to-gif-converter.gif)
+
 ## Structure
 
 PlacementController.luau contains the main placement system,
