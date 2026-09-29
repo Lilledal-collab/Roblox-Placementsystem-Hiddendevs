@@ -34,6 +34,8 @@ collision validation, preview handling and deletion.
 Placement.luau is the small startup script that requires
 the controller.
 
+This is my third time trying to get this approved.
+
 ## Dependency
 
 Trove by Stephen Leitnick / Sleitnick RbxUtil is used for
