@@ -1,4 +1,3 @@
--- Study version: same placement-system functionality, with redundant state removed and rotated collision footprint corrected.
 -- discord: @lilledal_ , roblox: @Hasaaawuw72
 --!strict
 --[[
