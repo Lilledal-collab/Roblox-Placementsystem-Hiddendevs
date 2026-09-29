@@ -65,7 +65,8 @@ type ControllerData = {
 	_lastValidPlacement: boolean?,
 	_blockSize: Vector3?,
 	_blockPivotOffset: CFrame?,
-	_currentCFrame: CFrame?,
+	_visualPosition: Vector3?,
+	_visualRotation: CFrame?,
 	_targetCFrame: CFrame?,
 	_trove: TroveType,
 	_previewTrove: TroveType,
@@ -556,7 +557,8 @@ function PlacementController.CreatePreview(
 	self._previewTrove:Add(preview)
 	self._rotation = 0
 	self._rotationCFrame = CFrame.new()
-	self._currentCFrame = nil
+	self._visualPosition = nil
+	self._visualRotation = nil
 	self._targetCFrame = nil
 	self._canPlace = false
 	self._lastValidPlacement = nil
@@ -672,37 +674,61 @@ function PlacementController.ComputeTargetCFrame(
 end
 
 --[[
-	Moves the preview using frame-rate-independent visual interpolation.
-	The interpolation alpha is clamped to 1 so a large frame time can never
-	produce an invalid Lerp fraction. Importantly, only the preview is smoothed:
-	the authoritative target remains the exact CFrame returned by the math above.
-]]
+	Smooths position and rotation independently instead of interpolating one
+	complete CFrame. This prevents a 90-degree rotation from also producing
+	a visible positional jump when the rotated bounding box has a different
+	surface offset.
 
+	The exponential interpolation keeps the movement consistent across
+	different frame rates. The target CFrame is still kept separately and is
+	used for collision validation and the actual placement.
+]]
 function PlacementController.UpdatePreviewTransform(
 	self: PlacementControllerType,
 	targetCFrame: CFrame,
 	deltaTime: number
 )
-	if self._currentCFrame then
-		local alpha = math.min(
-			deltaTime * PREVIEW_LERP_SPEED,
-			1
-		)
-		self._currentCFrame = self._currentCFrame:Lerp(
-			targetCFrame,
+	local alpha = 1 - math.exp(-PREVIEW_LERP_SPEED * deltaTime)
+
+	local targetPosition = targetCFrame.Position
+	local targetRotation = self._rotationCFrame
+
+	if self._visualPosition then
+		self._visualPosition = self._visualPosition:Lerp(
+			targetPosition,
 			alpha
 		)
 	else
-		self._currentCFrame = targetCFrame
+		self._visualPosition = targetPosition
 	end
-	local currentCFrame = self._currentCFrame
+
+	if self._visualRotation then
+		self._visualRotation = self._visualRotation:Lerp(
+			targetRotation,
+			alpha
+		)
+	else
+		self._visualRotation = targetRotation
+	end
+
 	local preview = self._preview
-	if not currentCFrame or not preview then
+	if not preview then
 		return
 	end
+
+	local visualPosition = self._visualPosition
+	local visualRotation = self._visualRotation
+
+	if not visualPosition or not visualRotation then
+		return
+	end
+
 	local pivotOffset = self._blockPivotOffset or CFrame.new()
+
 	preview:PivotTo(
-		currentCFrame * pivotOffset
+		CFrame.new(visualPosition)
+			* visualRotation
+			* pivotOffset
 	)
 end
 
@@ -891,7 +917,8 @@ function PlacementController.Cancel(
 	self._lastValidPlacement = nil
 	self._blockSize = nil
 	self._blockPivotOffset = nil
-	self._currentCFrame = nil
+	self._visualPosition = nil
+	self._visualRotation = nil
 	self._targetCFrame = nil
 	self._previewTrove:Clean()
 	self:UpdateFilters()
