@@ -1,128 +1,55 @@
--- discord: @lilledal_ , roblox: @Hasaaawuw72
+-- Connected Discord-GitHub | Discord: @lilledal_ | Roblox: @Hasaaawuw72
 --!strict
+
 --[[
-	Building / Placement System
-	This is the client-side controller for my building system.
-	The main idea is that the player gets a transparent copy of
-	the block they're trying to place, and that copy follows the
-	mouse until the player either places it or cancels.
-	I keep the placement logic inside one controller so rotation,
-	grid snapping, collision checks, delete mode and the preview
-	all share the same state instead of each part of the system
-	having to manage its own variables.
-	made by Leonel Lilledal
+	BUILDING / PLACEMENT CONTROLLER
+
+	Client-side controller for the building system used in this demo.
+	It handles player input, raycasting, grid snapping, rotation,
+	collision checking, preview movement, placement, and deletion.
+
+	The preview is kept separate from the actual placed model. Placement
+	is calculated from a target CFrame which is also used for collision
+	checking, while the preview is smoothly moved toward that target
+	only for visual feedback.
+
+	Open-source dependency:
+	Trove by Stephen Leitnick (Sleitnick), from RbxUtil.
+	Used for managing connections and temporary instances.
+	https://github.com/Sleitnick/RbxUtil/tree/main/modules/trove
 ]]
+
+
 --// Services
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
---// Folders / modules
--- Blocks contains the actual models that can be selected and placed.
--- Trove is mainly used here so temporary connections and previews
--- don't stay around after they're no longer needed.
+
+--// Dependencies / folders
+-- Blocks is treated as data: templates are never moved into Workspace.
+-- The placed folder is created once so delete mode can distinguish objects
+-- created by this controller from arbitrary map Models.
 local Blocks = ReplicatedStorage:WaitForChild("Blocks")
 local Trove = require(ReplicatedStorage:WaitForChild("Trove"))
+
 --// Player
 local player = Players.LocalPlayer
---// Building settings
--- I use a small list instead of one fixed grid value because I want
--- the player to be able to quickly switch between coarse and precise
--- placement without changing the actual placement code.
+
+--// Configuration
 local GRID_SIZES = {1, 2, 4, 8}
--- The raycast is deliberately limited so the building system can't
--- place or interact with something far away from the player.
 local BUILD_RANGE = 70
--- This only affects the visual movement of the preview. The actual
--- placement position still comes from the calculated target CFrame.
-local LERP_SPEED = 20
---[[
-	Gets whatever the mouse is pointing at.
-	I use a camera ray instead of Mouse.Hit because I need the
-	RaycastResult itself. That gives me both the hit position and
-	the surface normal, which are important for putting a block
-	against walls/floors and for deciding which axes should snap.
-	The camera is optional here because CurrentCamera isn't
-	guaranteed to exist at every possible point in the client's
-	lifetime.
-]]
-local function GetMouseHit(
-	camera: Camera?,
-	params: RaycastParams
-): RaycastResult?
-	if not camera then
-		return nil
-	end
-	-- Get the mouse position in screen space and turn it into
-	-- a world-space ray starting from the current camera.
-	local mousePosition = UserInputService:GetMouseLocation()
-	local ray = camera:ViewportPointToRay(
-		mousePosition.X,
-		mousePosition.Y
-	)
-	-- The same raycast parameters are passed in from the controller
-	-- so the caller decides what the ray should ignore.
-	return workspace:Raycast(
-		ray.Origin,
-		ray.Direction * BUILD_RANGE,
-		params
-	)
-end
---[[
-	Snaps a position to the selected grid size.
-	The important part here is that I don't blindly snap all three
-	axes. If the player is pointing at a vertical wall, for example,
-	the wall's normal tells me which axis represents the surface.
-	That axis is kept as-is while the other axes are snapped. This
-	prevents the block from being pulled away from the surface just
-	because the grid rounding changed its position.
-]]
-local function SnapPosToGrid(
-	position: Vector3,
-	gridSize: number,
-	normal: Vector3
-): Vector3
-	local x = if math.abs(normal.X) > 0.5
-		then position.X
-		else math.round(position.X / gridSize) * gridSize
-	local y = if math.abs(normal.Y) > 0.5
-		then position.Y
-		else math.round(position.Y / gridSize) * gridSize
-	local z = if math.abs(normal.Z) > 0.5
-		then position.Z
-		else math.round(position.Z / gridSize) * gridSize
-	return Vector3.new(x, y, z)
-end
---[[
-	Turns a normal model into the visual preview used while building.
-	The preview is anchored and non-collidable because it should only
-	show the player where the block would go. If it could collide or
-	be queried by raycasts, the preview itself could interfere with
-	the placement calculations.
-]]
-local function MakePreview(model: Model)
-	for _, object in model:GetDescendants() do
-		if not object:IsA("BasePart") then
-			continue
-		end
-		object.Anchored = true
-		object.CanCollide = false
-		object.CanQuery = false
-		object.Transparency = 0.5
-	end
-end
---// Controller
-local PlacementController = {}
-PlacementController.__index = PlacementController
---[[
-	This is the state that belongs to one placement controller.
-	Most of these values are cached because Update() runs every
-	Heartbeat. For example, the block's size and pivot offset don't
-	need to be recalculated every frame when the selected block hasn't
-	changed.
-	The controller also keeps placement and delete mode separate so
-	they can't accidentally process the same mouse click.
-]]
+local PREVIEW_LERP_SPEED = 20
+local PREVIEW_TRANSPARENCY = 0.5
+local COLLISION_EPSILON = 0.02
+local MIN_CHECK_AXIS = 0.05
+local PLACED_FOLDER_NAME = "ClientPlacedBlocks"
+local PLACED_BLOCK_TAG = "DemoPlacedBlock"
+
+--// Types
+type TroveType = typeof(Trove.new())
 type ControllerData = {
 	_gridIndex: number,
 	_rotation: number,
@@ -131,6 +58,7 @@ type ControllerData = {
 	_selectedBlock: Model?,
 	_preview: Model?,
 	_deleteHighlight: Highlight?,
+	_placedFolder: Folder?,
 	_placing: boolean,
 	_canPlace: boolean,
 	_deleting: boolean,
@@ -139,39 +67,259 @@ type ControllerData = {
 	_blockPivotOffset: CFrame?,
 	_currentCFrame: CFrame?,
 	_targetCFrame: CFrame?,
-	_trove: any,
-	_previewTrove: any,
+	_trove: TroveType,
+	_previewTrove: TroveType,
 	_raycastParams: RaycastParams,
 	_overlapParams: OverlapParams,
 }
+
+local PlacementController = {}
+PlacementController.__index = PlacementController
 type PlacementControllerType = typeof(setmetatable(
 	{} :: ControllerData,
 	PlacementController
 	))
+
 --[[
-	Creates the controller and gives it its initial state.
-	I keep the selected block, preview, rotation and placement state
-	on the controller instead of using separate global variables.
-	This makes it much easier to reset everything when the player
-	cancels building or changes block.
-	The two Troves are intentional: the main one owns the lifetime
-	of the controller, while previewTrove can clean only the current
-	preview when the player switches blocks.
+	Returns a dedicated Workspace folder for this demo controller.
+	The folder is deliberately separate from the map. Delete mode later uses
+	the folder together with a CollectionService tag and owner attribute, so
+	a click cannot accidentally destroy an NPC, building prop, or terrain Model.
 ]]
+local function GetPlacedFolder(): Folder
+	local existing = workspace:FindFirstChild(PLACED_FOLDER_NAME)
+	if existing then
+		assert(
+			existing:IsA("Folder"),
+			`Workspace.{PLACED_FOLDER_NAME} must be a Folder`
+		)
+		return existing
+	end
+	local folder = Instance.new("Folder")
+	folder.Name = PLACED_FOLDER_NAME
+	folder.Parent = workspace
+	return folder
+end
+
+--[[
+	Gets only Model templates from ReplicatedStorage.Blocks and sorts them
+	by name. Filtering here prevents a non-Model child from consuming a
+	selection index, while sorting makes F-cycling deterministic between runs.
+]]
+local function GetBlockTemplates(): {Model}
+	local templates: {Model} = {}
+	for _, child in Blocks:GetChildren() do
+		if child:IsA("Model") then
+			table.insert(templates, child)
+		end
+	end
+	table.sort(templates, function(a, b)
+		return a.Name:lower() < b.Name:lower()
+	end)
+	return templates
+end
+
+--[[
+	Builds a camera ray from the actual mouse position.
+	GetMouseLocation() includes the top-left GUI inset on Roblox clients,
+	while ViewportPointToRay() expects viewport-relative coordinates. Removing
+	the inset keeps the ray aligned with the cursor instead of being vertically
+	offset by the CoreGui/top-bar region.
+]]
+local function GetMouseHit(
+	camera: Camera?,
+	params: RaycastParams
+): RaycastResult?
+	if not camera then
+		return nil
+	end
+	local mousePosition = UserInputService:GetMouseLocation()
+	local topLeftInset = GuiService:GetGuiInset()
+	local viewportX = mousePosition.X - topLeftInset.X
+	local viewportY = mousePosition.Y - topLeftInset.Y
+	local ray = camera:ViewportPointToRay(viewportX, viewportY)
+	return workspace:Raycast(
+		ray.Origin,
+		ray.Direction * BUILD_RANGE,
+		params
+	)
+end
+
+--[[
+	Chooses the dominant axis of a surface normal.
+	Grid snapping should preserve the coordinate that represents the surface
+	depth. On a flat floor this is Y; on a vertical wall it is X or Z. Picking
+	the dominant component also behaves predictably on sloped surfaces instead
+	of requiring the normal to be almost perfectly axis-aligned.
+]]
+local function GetDominantNormalAxis(
+	normal: Vector3
+): "X" | "Y" | "Z"
+	local absX = math.abs(normal.X)
+	local absY = math.abs(normal.Y)
+	local absZ = math.abs(normal.Z)
+	if absX >= absY and absX >= absZ then
+		return "X"
+	end
+	if absY >= absZ then
+		return "Y"
+	end
+	return "Z"
+end
+
+--[[
+	Snaps world-space coordinates while preserving the dominant surface axis.
+	The untouched axis is intentional: if X represents wall depth, rounding X
+	would move the preview away from the exact raycast surface. The other two
+	axes are quantized to the selected build grid.
+]]
+local function SnapPositionToGrid(
+	position: Vector3,
+	gridSize: number,
+	normal: Vector3
+): Vector3
+	local axis = GetDominantNormalAxis(normal)
+	local x = if axis == "X"
+		then position.X
+		else math.round(position.X / gridSize) * gridSize
+	local y = if axis == "Y"
+		then position.Y
+		else math.round(position.Y / gridSize) * gridSize
+	local z = if axis == "Z"
+		then position.Z
+		else math.round(position.Z / gridSize) * gridSize
+	return Vector3.new(x, y, z)
+end
+
+--[[
+	Returns the distance an axis-aligned bounding box extends along a normal.
+	This is the support value of the box: |nx|*hx + |ny|*hy + |nz|*hz.
+	It is more robust than multiplying the normal by a Vector3 because
+	Vector3-vector multiplication is not the scalar offset needed here.
+	For floors the result becomes half-height; for walls it becomes the
+	relevant half-width, and diagonal normals remain mathematically valid.
+]]
+local function GetSurfaceOffset(
+	normal: Vector3,
+	worldSize: Vector3
+): number
+	local halfSize = worldSize / 2
+	return (
+		math.abs(normal.X) * halfSize.X
+			+ math.abs(normal.Y) * halfSize.Y
+			+ math.abs(normal.Z) * halfSize.Z
+	)
+end
+
+--[[
+	Rotating a Vector3 by a CFrame produces the rotated dimensions around
+	the selected Y axis. Taking absolute values converts signed extents into
+	a world-space bounding size suitable for overlap queries.
+]]
+local function GetRotatedWorldSize(
+	size: Vector3,
+	rotation: CFrame
+): Vector3
+	local rotatedSize = rotation * size
+	return Vector3.new(
+		math.abs(rotatedSize.X),
+		math.abs(rotatedSize.Y),
+		math.abs(rotatedSize.Z)
+	)
+end
+
+--[[
+	Prepares a cloned Model to become a purely visual preview.
+	Script descendants are removed so a template containing executable
+	content cannot accidentally create a second runtime controller when
+	cloned locally. Physics interaction is disabled because the preview is
+	feedback, not a physical object, and query exclusion prevents it from
+	intercepting the controller's own raycast/overlap checks.
+]]
+local function PreparePreview(model: Model)
+	for _, object in model:GetDescendants() do
+		if object:IsA("BaseScript") or object:IsA("ModuleScript") then
+			object:Destroy()
+			continue
+		end
+		if not object:IsA("BasePart") then
+			continue
+		end
+		object.Anchored = true
+		object.CanCollide = false
+		object.CanTouch = false
+		object.CanQuery = false
+		object.Massless = true
+		object.Transparency = PREVIEW_TRANSPARENCY
+	end
+end
+
+--[[
+	Updates the preview colour only when its validity state changes.
+	Update() executes every render frame, so skipping identical property writes
+	reduces replicated/client property churn for models containing many parts.
+	The colours communicate state to the player without changing placement data.
+]]
+local function SetPreviewColor(
+	model: Model?,
+	isValid: boolean
+)
+	if not model then
+		return
+	end
+	local targetColor = if isValid
+		then Color3.fromRGB(70, 255, 120)
+		else Color3.fromRGB(255, 80, 80)
+	for _, object in model:GetDescendants() do
+		if object:IsA("BasePart") then
+			object.Color = targetColor
+		end
+	end
+end
+
+--[[
+	Searches upward for the actual model this controller placed.
+	This is intentionally tag-based instead of trusting the first Model
+	ancestor. A map can contain nested Models, while the placement demo can
+	safely restrict deletion to objects carrying the controller's tag.
+]]
+local function FindPlacedModel(
+	instance: Instance?,
+	expectedOwnerId: number
+): Model?
+	local current = instance
+	while current and current ~= workspace do
+		if current:IsA("Model")
+			and CollectionService:HasTag(current, PLACED_BLOCK_TAG)
+			and current:GetAttribute("PlacedByUserId") == expectedOwnerId
+		then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+--[[
+	Creates a controller with explicit state rather than relying on globals.
+	The separate preview Trove is a lifecycle boundary: changing the selected
+	block should destroy only the temporary clone, while the main Trove still
+	owns input connections, render updates and the reusable delete Highlight.
+]]
+
 function PlacementController.new(): PlacementControllerType
 	local self = setmetatable({
 		_gridIndex = 1,
 		_rotation = 0,
 		_rotationCFrame = CFrame.new(),
-		-- 0 means that there isn't a selected block yet.
 		_blockIndex = 0,
 		_selectedBlock = nil,
 		_preview = nil,
 		_deleteHighlight = nil,
+		_placedFolder = GetPlacedFolder(),
 		_placing = false,
 		_canPlace = false,
 		_deleting = false,
-		_lastTargetCFrame = nil,
 		_lastValidPlacement = nil,
 		_blockSize = nil,
 		_blockPivotOffset = nil,
@@ -182,53 +330,68 @@ function PlacementController.new(): PlacementControllerType
 		_raycastParams = RaycastParams.new(),
 		_overlapParams = OverlapParams.new(),
 	}, PlacementController) :: any
-	-- previewTrove is an extension of the main Trove.
-	-- That means destroying the controller destroys everything,
-	-- but switching blocks can clean just the old preview.
 	self._previewTrove = self._trove:Extend()
-	-- Both queries use exclusion filters because the player and
-	-- the temporary preview should never count as a build target.
 	self._raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	self._raycastParams.IgnoreWater = true
 	self._overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-	-- The delete highlight is created once instead of every frame.
-	-- During delete mode I only change its Adornee, which avoids
-	-- constantly creating and destroying Highlight instances.
-	local highlight = self._trove:Add(
-		Instance.new("Highlight")
-	)
+	self._overlapParams.MaxParts = 32
+	self._overlapParams.RespectCanCollide = true
+	local highlight = self._trove:Add(Instance.new("Highlight"))
 	highlight.FillTransparency = 1
-	highlight.OutlineColor = Color3.fromRGB(255, 0, 0)
+	highlight.OutlineColor = Color3.fromRGB(255, 65, 65)
 	highlight.DepthMode = Enum.HighlightDepthMode.Occluded
 	highlight.Enabled = false
 	highlight.Parent = workspace
 	self._deleteHighlight = highlight
-	-- Everything is ready, so start listening for input and
-	-- updating the placement state.
 	self:Start()
 	return self
 end
+
 --[[
-	Starts the two things that keep the system alive:
-	1. Heartbeat updates the preview and checks placement every frame.
-	2. InputBegan handles keyboard/mouse controls.
-	I also refresh the raycast filters when the character respawns,
-	because the Character instance changes after respawning.
+	Builds a single exclusion list shared by the raycast and overlap query.
+	The Character must be ignored so clicking one's own body cannot become a
+	build surface. The preview must also be ignored or the transparent clone
+	could intercept the cursor ray before the real map surface is reached.
 ]]
+
+function PlacementController.UpdateFilters(
+	self: PlacementControllerType
+)
+	local filterObjects: {Instance} = {}
+	if self._preview then
+		table.insert(filterObjects, self._preview)
+	end
+	if player.Character then
+		table.insert(filterObjects, player.Character)
+	end
+	self._raycastParams.FilterDescendantsInstances = filterObjects
+	self._overlapParams.FilterDescendantsInstances = filterObjects
+end
+
+--[[
+	Starts the runtime loop and input layer.
+	RenderStepped is used for this controller because the preview is purely
+	client-side visual feedback. Updating immediately before rendering avoids
+	a one-frame visual delay compared with a general simulation heartbeat.
+]]
+
 function PlacementController.Start(
 	self: PlacementControllerType
 )
 	self._trove:Add(
-		RunService.Heartbeat:Connect(function(deltaTime)
+		RunService.RenderStepped:Connect(function(deltaTime)
 			self:Update(deltaTime)
 		end)
 	)
 	self._trove:Add(
 		UserInputService.InputBegan:Connect(function(
-			input,
-			gameProcessed
+			input: InputObject,
+			gameProcessed: boolean
 		)
-			-- UI/gameplay systems get first priority over building input.
 			if gameProcessed then
+				return
+			end
+			if UserInputService:GetFocusedTextBox() then
 				return
 			end
 			self:ProcessInput(input)
@@ -241,18 +404,18 @@ function PlacementController.Start(
 	)
 	self:UpdateFilters()
 end
+
 --[[
-	Converts the raw keyboard/mouse input into controller actions.
-	I keep the actual actions in separate functions instead of doing
-	all of the building logic here. This function is basically the
-	"input layer" of the system, while functions like Rotate(),
-	Place() and Delete() contain the actual behaviour.
+	Translates raw input into state-machine commands.
+	The input function deliberately contains no placement math. This separation
+	means adding a new control does not require touching collision, raycasting,
+	or preview logic, which keeps the controller easier to reason about.
 ]]
+
 function PlacementController.ProcessInput(
 	self: PlacementControllerType,
 	input: InputObject
 )
-	-- Left click has different behaviour depending on the current mode.
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
 		if self._deleting then
 			self:Delete()
@@ -260,29 +423,24 @@ function PlacementController.ProcessInput(
 			self:Place()
 		end
 	end
-	-- F cycles through the models in ReplicatedStorage.Blocks.
 	if input.KeyCode == Enum.KeyCode.F then
 		if self._placing then
 			self:CycleBlock()
 		end
 	end
-	-- R only rotates while there is an active placement.
 	if input.KeyCode == Enum.KeyCode.R then
 		if self._placing then
 			self:Rotate()
 		end
 	end
-	-- G changes the amount of grid snapping.
 	if input.KeyCode == Enum.KeyCode.G then
 		if self._placing then
 			self:CycleGridSize()
 		end
 	end
-	-- X switches between normal placement and delete mode.
 	if input.KeyCode == Enum.KeyCode.X then
 		self:ToggleDeleteMode()
 	end
-	-- Q acts as the main enter/exit button for building mode.
 	if input.KeyCode == Enum.KeyCode.Q then
 		if self._placing then
 			self:Cancel()
@@ -291,94 +449,88 @@ function PlacementController.ProcessInput(
 		end
 	end
 end
+
 --[[
-	Enters building mode using the last selected block.
-	The block index is kept even after cancelling, so pressing Q again
-	doesn't unexpectedly choose a completely different block. If
-	there has never been a valid selection, it starts at the first one.
+	Enters placement with the last valid block selection.
+	The index is retained across Q-cancel cycles so the controller remembers
+	the user's last tool choice. An invalid or out-of-range index falls back
+	to the first available Model template.
 ]]
+
 function PlacementController.EquipLastBlock(
 	self: PlacementControllerType
 )
-	local blocks = Blocks:GetChildren()
+	local blocks = GetBlockTemplates()
 	assert(
 		#blocks > 0,
-		"No blocks were found inside ReplicatedStorage.Blocks"
+		"No Model templates were found inside ReplicatedStorage.Blocks"
 	)
-	if self._blockIndex == 0
-		or self._blockIndex > #blocks then
+	if self._blockIndex < 1 or self._blockIndex > #blocks then
 		self._blockIndex = 1
 	end
-	local block = blocks[self._blockIndex]
-	-- The folder may technically contain other instance types,
-	-- so I don't try to create a preview unless it is actually a Model.
-	if block:IsA("Model") then
-		self:SelectBlock(block)
-	end
+	self:SelectBlock(blocks[self._blockIndex])
 end
+
 --[[
-	Moves the selection to the next available block.
-	The modulo calculation is what makes the selection wrap around,
-	so pressing F on the last block goes back to the first one.
+	Moves to the next sorted template using modulo arithmetic.
+	Keeping the index inside [1, #blocks] avoids the common off-by-one case
+	where pressing F on the last item produces index #blocks + 1.
 ]]
+
 function PlacementController.CycleBlock(
 	self: PlacementControllerType
 )
-	local blocks = Blocks:GetChildren()
+	local blocks = GetBlockTemplates()
 	assert(
 		#blocks > 0,
-		"No blocks were found inside ReplicatedStorage.Blocks"
+		"No Model templates were found inside ReplicatedStorage.Blocks"
 	)
-	self._blockIndex =
-		(self._blockIndex % #blocks) + 1
-	local nextBlock = blocks[self._blockIndex]
-	if nextBlock:IsA("Model") then
-		self:SelectBlock(nextBlock)
-	end
+	self._blockIndex = (self._blockIndex % #blocks) + 1
+	self:SelectBlock(blocks[self._blockIndex])
 end
+
 --[[
-	Sets a new block as the current placement target.
-	Before doing that I call Cancel() so the previous preview and
-	placement state are cleared. I then cache the bounding box and
-	the pivot relationship of the model.
-	The pivot offset matters because the model's pivot doesn't
-	necessarily sit exactly at the centre of its bounding box.
-	Keeping that offset means the preview and the final placed
-	model use the same positioning.
+	Switches the active Model and caches geometry that never needs to be
+	recomputed every frame.
+	GetBoundingBox supplies the template's oriented bounds, while ToObjectSpace
+	stores the relationship between the bounding-box CFrame and the model pivot.
+	That pivot offset is reapplied when both preview and final models move.
 ]]
+
 function PlacementController.SelectBlock(
 	self: PlacementControllerType,
 	blockTemplate: Model
 )
 	self:Cancel()
-	self._placing = true
 	self._selectedBlock = blockTemplate
-	local blockCFrame, blockSize =
-		blockTemplate:GetBoundingBox()
+	self._placing = true
+	local blockCFrame, blockSize = blockTemplate:GetBoundingBox()
 	self._blockSize = blockSize
-	self._blockPivotOffset =
-		blockCFrame:ToObjectSpace(
-			blockTemplate:GetPivot()
-		)
+	self._blockPivotOffset = blockCFrame:ToObjectSpace(
+		blockTemplate:GetPivot()
+	)
 	self:CreatePreview(blockTemplate)
 end
+
 --[[
-	Cycles through the grid sizes instead of changing the value
-	directly. This keeps the actual snapping code independent from
-	how the user chooses the grid size.
+	Cycles between a small set of intentional grid sizes.
+	The placement algorithm reads only the current grid value, so the control
+	scheme can change later without coupling input handling to snapping math.
 ]]
+
 function PlacementController.CycleGridSize(
 	self: PlacementControllerType
 )
-	self._gridIndex =
-		(self._gridIndex % #GRID_SIZES) + 1
+	self._gridIndex = (self._gridIndex % #GRID_SIZES) + 1
 end
+
 --[[
-	Switches delete mode on/off.
-	Cancel() normally resets both placement and delete state, so I
-	save the desired delete state first. Without doing that, calling
-	Cancel() here would immediately turn delete mode back off.
+	Toggles between placement and delete state.
+	Cancel() clears all transient placement data, so the desired delete state is
+	saved first and restored afterward. This guarantees the old preview cannot
+	remain interactive when the user switches modes.
 ]]
+
 function PlacementController.ToggleDeleteMode(
 	self: PlacementControllerType
 )
@@ -386,132 +538,90 @@ function PlacementController.ToggleDeleteMode(
 	self:Cancel()
 	self._deleting = newDeleteState
 end
+
 --[[
-	Creates the temporary model shown under the mouse.
-	The original template is cloned so the actual block in
-	ReplicatedStorage is never modified. The clone is then converted
-	into a non-collidable preview and given to previewTrove so it is
-	automatically removed when another preview is created.
+	Creates a visual clone without mutating the source template.
+	The preview Trove owns the clone, making block switching O(1) in controller
+	state: clean the old preview, create the new clone, then rebuild filters.
 ]]
+
 function PlacementController.CreatePreview(
 	self: PlacementControllerType,
 	blockTemplate: Model
 )
 	self._previewTrove:Clean()
 	local preview = blockTemplate:Clone()
+	PreparePreview(preview)
 	self._preview = preview
-	MakePreview(preview)
 	self._previewTrove:Add(preview)
-	-- A new block starts with no rotation from the previous selection.
 	self._rotation = 0
 	self._rotationCFrame = CFrame.new()
+	self._currentCFrame = nil
+	self._targetCFrame = nil
+	self._canPlace = false
+	self._lastValidPlacement = nil
 	self._placing = true
-	-- The new preview must be excluded from the raycast immediately.
 	self:UpdateFilters()
 end
+
 --[[
-	Keeps the raycast and overlap checks from interacting with
-	temporary/client-only objects.
-	The preview is especially important here: without excluding it,
-	the mouse ray could hit the transparent preview instead of the
-	actual surface underneath it.
+	Applies one 90-degree Y rotation to the placement basis.
+	Keeping rotation as an integer degree value gives the UI a simple cyclic
+	state, while the cached CFrame lets placement math use matrix operations
+	instead of reconstructing angles at every calculation.
 ]]
-function PlacementController.UpdateFilters(
-	self: PlacementControllerType
-)
-	local filterObjects: {Instance} = {}
-	if self._preview then
-		table.insert(
-			filterObjects,
-			self._preview
-		)
-	end
-	if player.Character then
-		table.insert(
-			filterObjects,
-			player.Character
-		)
-	end
-	self._raycastParams.FilterDescendantsInstances =
-		filterObjects
-	self._overlapParams.FilterDescendantsInstances =
-		filterObjects
-end
---[[
-	Adds another 90 degrees to the current rotation.
-	Keeping the rotation as a number makes cycling simple, while
-	_rotationCFrame gives the rest of the placement code a CFrame
-	it can directly multiply with the target position.
-]]
+
 function PlacementController.Rotate(
 	self: PlacementControllerType
 )
-	self._rotation =
-		(self._rotation + 90) % 360
-	self._rotationCFrame =
-		CFrame.Angles(
-			0,
-			math.rad(self._rotation),
-			0
-		)
+	self._rotation = (self._rotation + 90) % 360
+	self._rotationCFrame = CFrame.Angles(
+		0,
+		math.rad(self._rotation),
+		0
+	)
 end
+
 --[[
-	Updates the visual state of the preview.
-	I only recolor the model when the valid/invalid state actually
-	changes. Since Update() runs every frame, avoiding unnecessary
-	property writes here is useful, especially for models with many
-	parts.
-	Green means the collision test passed, red means something is
-	blocking the intended placement.
+	Validates that the controller has enough cached state to calculate a target.
+	This guard centralizes the preconditions shared by Update and Place, so
+	neither function needs to duplicate a chain of nil checks.
 ]]
-function PlacementController.UpdatePreviewColor(
-	self: PlacementControllerType,
-	isValidPlacement: boolean
-)
-	if not self._preview then
-		return
-	end
-	if self._lastValidPlacement == isValidPlacement then
-		return
-	end
-	self._lastValidPlacement =
-		isValidPlacement
-	local targetColor = if isValidPlacement
-		then Color3.fromRGB(0, 255, 0)
-		else Color3.fromRGB(255, 0, 0)
-	for _, object in self._preview:GetDescendants() do
-		if not object:IsA("BasePart") then
-			continue
-		end
-		object.Color = targetColor
-	end
+
+function PlacementController.CanPlace(
+	self: PlacementControllerType
+): boolean
+	return (
+		self._placing
+			and self._preview ~= nil
+			and self._selectedBlock ~= nil
+			and self._blockSize ~= nil
+	)
 end
+
 --[[
-	Checks whether the space occupied by the block is already taken.
-	I shrink the test box by a tiny amount so two blocks can touch
-	without being treated as overlapping. This is important for a
-	building system because otherwise perfectly adjacent blocks could
-	be rejected due to their bounding boxes touching.
-	The overlap query can return non-collidable parts too, so I only
-	treat parts with CanCollide enabled as actual blockers.
+	Checks whether the target bounding box is free.
+	The query box is contracted by a tiny epsilon, allowing two blocks to touch
+	at exactly the same face without floating-point contact being interpreted as
+	an overlap. RespectCanCollide filters the query toward actual physical
+	blockers instead of decorative, non-collidable parts.
 ]]
+
 function PlacementController.CheckCollisions(
 	self: PlacementControllerType,
 	cframe: CFrame,
 	size: Vector3
 ): boolean
-	local checkSize =
-		size - Vector3.new(
-			0.01,
-			0.01,
-			0.01
-		)
-	local parts =
-		workspace:GetPartBoundsInBox(
-			cframe,
-			checkSize,
-			self._overlapParams
-		)
+	local checkSize = Vector3.new(
+		math.max(size.X - COLLISION_EPSILON, MIN_CHECK_AXIS),
+		math.max(size.Y - COLLISION_EPSILON, MIN_CHECK_AXIS),
+		math.max(size.Z - COLLISION_EPSILON, MIN_CHECK_AXIS)
+	)
+	local parts = workspace:GetPartBoundsInBox(
+		cframe,
+		checkSize,
+		self._overlapParams
+	)
 	for _, part in parts do
 		if part.CanCollide then
 			return false
@@ -519,279 +629,298 @@ function PlacementController.CheckCollisions(
 	end
 	return true
 end
+
 --[[
-	This is a small guard used before placement calculations.
-	Most of Update() depends on the preview, selected block and
-	cached block size existing. Instead of repeating those checks
-	everywhere, I keep them in one function.
+	Calculates the exact target CFrame from one raycast result.
+	The steps are deliberately ordered:
+	1. rotate the cached size to get world extents,
+	2. push the box out of the surface using its support distance,
+	3. snap the non-depth axes to the selected grid,
+	4. compose position and 90-degree rotation into one CFrame.
+	That single CFrame becomes the source of truth for preview placement,
+	collision validation and the final cloned model.
 ]]
-function PlacementController.CanPlace(
-	self: PlacementControllerType
-): boolean
-	if not self._placing then
-		return false
-	end
-	if not self._preview then
-		return false
-	end
-	if not self._selectedBlock then
-		return false
-	end
-	if not self._blockSize then
-		return false
-	end
-	return true
+
+function PlacementController.ComputeTargetCFrame(
+	self: PlacementControllerType,
+	result: RaycastResult
+): (CFrame, Vector3)
+	local blockSize = assert(
+		self._blockSize,
+		"Block size is required before computing placement"
+	)
+	local worldSize = GetRotatedWorldSize(
+		blockSize,
+		self._rotationCFrame
+	)
+	local surfaceOffset = GetSurfaceOffset(
+		result.Normal,
+		worldSize
+	)
+	local surfacePosition =
+		result.Position
+		+ result.Normal * surfaceOffset
+	local gridSize = GRID_SIZES[self._gridIndex]
+	local snappedPosition = SnapPositionToGrid(
+		surfacePosition,
+		gridSize,
+		result.Normal
+	)
+	local targetCFrame = CFrame.new(snappedPosition)
+		* self._rotationCFrame
+	return targetCFrame, worldSize
 end
+
 --[[
-	This is the main part of the system.
-	Every frame I first decide whether the controller is in delete
-	mode or placement mode. In placement mode the mouse ray gives me
-	the surface, the surface normal is used to calculate where the
-	block should sit, then grid snapping and rotation are applied.
-	The preview is moved smoothly toward that calculated position,
-	but collision checking still uses the actual target CFrame. This
-	keeps the visual interpolation from affecting whether placement
-	is considered valid.
+	Moves the preview using frame-rate-independent visual interpolation.
+	The interpolation alpha is clamped to 1 so a large frame time can never
+	produce an invalid Lerp fraction. Importantly, only the preview is smoothed:
+	the authoritative target remains the exact CFrame returned by the math above.
 ]]
+
+function PlacementController.UpdatePreviewTransform(
+	self: PlacementControllerType,
+	targetCFrame: CFrame,
+	deltaTime: number
+)
+	if self._currentCFrame then
+		local alpha = math.min(
+			deltaTime * PREVIEW_LERP_SPEED,
+			1
+		)
+		self._currentCFrame = self._currentCFrame:Lerp(
+			targetCFrame,
+			alpha
+		)
+	else
+		self._currentCFrame = targetCFrame
+	end
+	local currentCFrame = self._currentCFrame
+	local preview = self._preview
+	if not currentCFrame or not preview then
+		return
+	end
+	local pivotOffset = self._blockPivotOffset or CFrame.new()
+	preview:PivotTo(
+		currentCFrame * pivotOffset
+	)
+end
+
+--[[
+	Handles delete-mode targeting.
+	The same camera ray used by placement is used here, but the result is passed
+	through FindPlacedModel(). That extra ownership check is the safety boundary
+	that stops X + click from deleting unrelated map content.
+]]
+
+function PlacementController.UpdateDeleteMode(
+	self: PlacementControllerType
+)
+	local highlight = self._deleteHighlight
+	if not self._deleting or not highlight then
+		return
+	end
+	local result = GetMouseHit(
+		workspace.CurrentCamera,
+		self._raycastParams
+	)
+	local targetModel = if result
+		then FindPlacedModel(
+			result.Instance,
+			player.UserId
+		)
+		else nil
+	if highlight.Adornee ~= targetModel then
+		highlight.Adornee = targetModel
+		highlight.Enabled = targetModel ~= nil
+	end
+end
+
+--[[
+	Updates the entire placement state once per render frame.
+	Placement and delete mode are exclusive branches. This keeps the two input
+	interpretations isolated and means collision work is skipped completely
+	while the user is browsing delete targets.
+]]
+
 function PlacementController.Update(
 	self: PlacementControllerType,
 	deltaTime: number
 )
-	--// DELETE MODE
-	if self._deleting and self._deleteHighlight then
-		local result =
-			GetMouseHit(
-				workspace.CurrentCamera,
-				self._raycastParams
-			)
-		if result and result.Instance then
-			-- A ray normally hits a Part, so I walk up to its
-			-- containing Model before showing the delete target.
-			local targetModel =
-				result.Instance:FindFirstAncestorOfClass(
-					"Model"
-				)
-			if targetModel then
-				-- The highlight is reused. Changing the Adornee only
-				-- when the model changes avoids unnecessary updates.
-				if self._deleteHighlight.Adornee
-					~= targetModel then
-					self._deleteHighlight.Adornee =
-						targetModel
-					self._deleteHighlight.Enabled =
-						true
-				end
-				return
-			end
-		end
-		self._deleteHighlight.Enabled = false
-		self._deleteHighlight.Adornee = nil
+	if self._deleting then
+		self:UpdateDeleteMode()
 		return
 	end
-	--// PLACEMENT MODE
 	if not self:CanPlace() then
 		return
 	end
-	local result =
-		GetMouseHit(
-			workspace.CurrentCamera,
-			self._raycastParams
-		)
-	-- I don't keep the preview visible when the mouse isn't
-	-- pointing at a valid world surface.
-	if self._preview then
-		self._preview.Parent =
-			if result then workspace else nil
-	end
+	local result = GetMouseHit(
+		workspace.CurrentCamera,
+		self._raycastParams
+	)
+	local preview = self._preview
 	if not result then
 		self._canPlace = false
+		if preview then
+			preview.Parent = nil
+		end
+		if self._lastValidPlacement ~= false then
+			self._lastValidPlacement = false
+			SetPreviewColor(preview, false)
+		end
 		return
 	end
-	local blockSize = self._blockSize
-	if not blockSize then
-		return
+	if preview and preview.Parent ~= workspace then
+		preview.Parent = workspace
 	end
-	-- Rotating a rectangular size swaps its X/Z dimensions.
-	-- Taking the absolute values gives us a usable world-space
-	-- bounding size regardless of the current 90-degree rotation.
-	local rotatedSize =
-		self._rotationCFrame * blockSize
-	local absoluteSize = Vector3.new(
-		math.abs(rotatedSize.X),
-		math.abs(rotatedSize.Y),
-		math.abs(rotatedSize.Z)
+	local targetCFrame, worldSize =
+		self:ComputeTargetCFrame(result)
+	self._targetCFrame = targetCFrame
+	self:UpdatePreviewTransform(
+		targetCFrame,
+		deltaTime
 	)
-	-- Move the centre of the block away from the surface by half
-	-- of its size. The normal tells us which direction the surface
-	-- faces, so the block ends up sitting against it instead of
-	-- being centred inside the surface.
-	local newPosition =
-		result.Position
-		+ result.Normal * (absoluteSize / 2)
-	-- Apply the currently selected grid.
-	local gridSize =
-		GRID_SIZES[self._gridIndex]
-	local gridPosition =
-		SnapPosToGrid(
-			newPosition,
-			gridSize,
-			result.Normal
-		)
-	-- Position and rotation are combined into the CFrame that
-	-- represents where the block would actually be placed.
-	local targetCFrame =
-		CFrame.new(gridPosition)
-		* self._rotationCFrame
-	self._targetCFrame =
-		targetCFrame
-	--// SMOOTH MOVEMENT
-	-- The preview is intentionally interpolated instead of snapping
-	-- instantly to every tiny mouse movement. This makes the preview
-	-- easier to follow visually without changing the actual target.
-	if self._currentCFrame then
-		self._currentCFrame =
-			self._currentCFrame:Lerp(
-				targetCFrame,
-				math.min(
-					deltaTime * LERP_SPEED,
-					1
-				)
-			)
-	else
-		self._currentCFrame =
-			targetCFrame
-	end
-	local currentCFrame =
-		self._currentCFrame
-	if not currentCFrame then
-		return
-	end
-	-- Apply the cached pivot offset so models whose pivot isn't
-	-- centred still appear exactly where their bounding box expects.
-	if self._preview then
-		local pivotOffset =
-			self._blockPivotOffset
-			or CFrame.new()
-		self._preview:PivotTo(
-			currentCFrame * pivotOffset
-		)
-	end
-	-- Collision checking is done against the target position rather
-	-- than the interpolated preview position. This prevents the
-	-- visual smoothing from causing a placement delay or inaccurate
-	-- collision result.
-	self._canPlace =
-		self:CheckCollisions(
-			targetCFrame,
-			absoluteSize
-		)
-	self:UpdatePreviewColor(
-		self._canPlace
+	self._canPlace = self:CheckCollisions(
+		targetCFrame,
+		worldSize
 	)
+	if self._lastValidPlacement ~= self._canPlace then
+		self._lastValidPlacement = self._canPlace
+		SetPreviewColor(preview, self._canPlace)
+	end
 end
+
 --[[
-	Clones the selected template into the actual Workspace.
-	I don't move the preview itself into Workspace as the final object.
-	Instead I clone the original template again, which keeps the
-	preview purely visual and means the placed object starts with the
-	original properties of the template.
+	Commits a placement as a new Model instance.
+	The preview is never promoted into the real object. Cloning the original
+	template guarantees that temporary preview properties such as transparency,
+	Anchored, CanQuery and colour do not leak into the final block.
+
+	This demo intentionally performs the commit locally. In a production
+	multiplayer system, Place() should instead request a server-side commit and
+	the server should recalculate and validate the CFrame before cloning.
 ]]
+
 function PlacementController.Place(
 	self: PlacementControllerType
 )
-	if not self:CanPlace() then
+	if not self:CanPlace() or not self._canPlace then
 		return
 	end
-	-- The preview can exist even when its current location is blocked,
-	-- so this check is what actually prevents invalid placement.
-	if not self._canPlace then
-		return
-	end
-	local selectedBlock =
-		self._selectedBlock
-	local targetCFrame =
-		self._targetCFrame
-	local pivotOffset =
-		self._blockPivotOffset
+	local selectedBlock = self._selectedBlock
+	local targetCFrame = self._targetCFrame
+	local pivotOffset = self._blockPivotOffset
+	local placedFolder = self._placedFolder
 	if not selectedBlock
 		or not targetCFrame
-		or not pivotOffset then
+		or not pivotOffset
+		or not placedFolder
+	then
 		return
 	end
-	local placedModel =
-		selectedBlock:Clone()
+	local placedModel = selectedBlock:Clone()
 	placedModel:PivotTo(
 		targetCFrame * pivotOffset
 	)
-	placedModel.Parent = workspace
+	placedModel:SetAttribute(
+		"PlacedByUserId",
+		player.UserId
+	)
+	placedModel:SetAttribute(
+		"PlacedFromTemplate",
+		selectedBlock.Name
+	)
+	CollectionService:AddTag(
+		placedModel,
+		PLACED_BLOCK_TAG
+	)
+	placedModel.Parent = placedFolder
 end
+
 --[[
-	Deletes the model currently underneath the mouse.
-	The same raycast/filtering used by the highlight is used here,
-	so the object shown as the delete target is normally the object
-	that gets removed when the player clicks.
+	Deletes only a model produced by this controller for the current player.
+	The owner attribute and CollectionService tag form two independent checks:
+	the tag describes the object category, while the attribute describes who
+	created it. This is intentionally stricter than deleting any Model hit by
+	the mouse ray.
 ]]
+
 function PlacementController.Delete(
 	self: PlacementControllerType
 )
 	if not self._deleting then
 		return
 	end
-	local result =
-		GetMouseHit(
-			workspace.CurrentCamera,
-			self._raycastParams
-		)
+	local result = GetMouseHit(
+		workspace.CurrentCamera,
+		self._raycastParams
+	)
 	if not result then
 		return
 	end
-	local targetModel =
-		result.Instance:FindFirstAncestorOfClass(
-			"Model"
-		)
+	local targetModel = FindPlacedModel(
+		result.Instance,
+		player.UserId
+	)
 	if targetModel then
 		targetModel:Destroy()
+		local highlight = self._deleteHighlight
+		if highlight then
+			highlight.Adornee = nil
+			highlight.Enabled = false
+		end
 	end
 end
+
 --[[
-	Resets the temporary state of the controller.
-	This is used when the player leaves building mode, changes block,
-	or switches into delete mode. I reset the preview-related values
-	here so an old CFrame, selection or validity result can't leak
-	into the next placement.
-	The selected block index itself isn't reset, which is why the
-	system can remember the last block when Q is pressed again.
+	Cancels only the transient placement state.
+	The selected template index survives the cancel so Q can reopen the last
+	block, while preview geometry, collision status and delete highlighting
+	are fully cleared. Filters are rebuilt after the preview is destroyed so
+	no stale Instance reference remains in either query object.
 ]]
+
 function PlacementController.Cancel(
 	self: PlacementControllerType
 )
 	self._placing = false
-	self._deleting = false
 	self._canPlace = false
+	self._deleting = false
 	self._selectedBlock = nil
 	self._preview = nil
 	self._lastValidPlacement = nil
+	self._blockSize = nil
+	self._blockPivotOffset = nil
 	self._currentCFrame = nil
 	self._targetCFrame = nil
 	self._previewTrove:Clean()
+	self:UpdateFilters()
 	if self._deleteHighlight then
 		self._deleteHighlight.Enabled = false
 		self._deleteHighlight.Adornee = nil
 	end
 end
+
 --[[
-	Completely removes the controller.
-	Unlike Cancel(), which only resets the current building state,
-	Destroy() is meant for when the entire system is no longer needed.
-	Trove then takes care of the Heartbeat connection, input
-	connection, respawn connection, highlight and any other objects
-	registered with it.
+	Releases the controller's entire lifetime graph.
+	Trove disconnects input/render connections, destroys the reusable Highlight,
+	and cleans the preview sub-Trove. Cancel() is called first so the controller
+	never leaves a visible preview behind while its connections are removed.
 ]]
+
 function PlacementController.Destroy(
 	self: PlacementControllerType
 )
+	self:Cancel()
 	self._trove:Destroy()
 end
--- The module creates its controller immediately, so requiring this
--- module gives the caller a ready-to-use building system.
-return PlacementController.new()
+
+--[[
+	The module creates its controller when required, so the demo only needs
+	this submitted ModuleScript plus the credited open-source Trove dependency.
+	The LocalScript only needs to require this module.
+]]
+
+local controller = PlacementController.new()
+
+return controller
