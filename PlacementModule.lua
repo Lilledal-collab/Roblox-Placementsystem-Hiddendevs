@@ -1,3 +1,4 @@
+-- Study version: same placement-system functionality, with redundant state removed and rotated collision footprint corrected.
 -- discord: @lilledal_ , roblox: @Hasaaawuw72
 --!strict
 --[[
@@ -134,7 +135,6 @@ type ControllerData = {
 	_placing: boolean,
 	_canPlace: boolean,
 	_deleting: boolean,
-	_lastTargetCFrame: CFrame?,
 	_lastValidPlacement: boolean?,
 	_blockSize: Vector3?,
 	_blockPivotOffset: CFrame?,
@@ -684,13 +684,11 @@ function PlacementController.Update(
 	self._canPlace =
 		self:CheckCollisions(
 			targetCFrame,
-			blockSize
+			absoluteSize
 		)
 	self:UpdatePreviewColor(
 		self._canPlace
 	)
-	self._lastTargetCFrame =
-		targetCFrame
 end
 --[[
 	Clones the selected template into the actual Workspace.
@@ -773,7 +771,6 @@ function PlacementController.Cancel(
 	self._canPlace = false
 	self._selectedBlock = nil
 	self._preview = nil
-	self._lastTargetCFrame = nil
 	self._lastValidPlacement = nil
 	self._currentCFrame = nil
 	self._targetCFrame = nil
