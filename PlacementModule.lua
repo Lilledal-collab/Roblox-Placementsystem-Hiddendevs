@@ -30,6 +30,7 @@
 ]]
 
 -- Services
+-- Shared services first: the rest of the controller depends on these Roblox APIs.
 local ReplicatedStorage = game:GetService("ReplicatedStorage") -- Shared storage is used so block templates and the Trove dependency can be accessed without duplicating them.
 local RunService = game:GetService("RunService") -- RenderStepped is used because preview interpolation is visual work that should follow the rendered frame rate.
 local UserInputService = game:GetService("UserInputService") -- Centralizing input here keeps building controls independent from the visual update loop.
@@ -43,6 +44,7 @@ local Trove = require(ReplicatedStorage:WaitForChild("Trove")) -- Trove is used 
 local player = Players.LocalPlayer -- This is a client-side controller, so all input and preview state belongs to the local player.
 
 -- Configuration
+-- These are the grid steps the player can cycle through. Example: grid 4 means positions snap in 4-stud steps.
 local GRID_SIZES = {1, 2, 4, 8} -- Multiple grid sizes let the same placement algorithm support both detailed and coarse building.
 local BUILD_RANGE = 70 -- Limiting the ray prevents players from selecting surfaces that are too far away to reasonably build on.
 local PREVIEW_LERP_SPEED = 20 -- Controls visual responsiveness without changing the exact target used by the placement logic.
@@ -86,6 +88,7 @@ type PlacementControllerType = typeof(setmetatable( -- This type connects the ru
     PlacementController
 ))
 
+-- Keep all locally created blocks in one predictable folder. This makes the workspace easier to inspect too.
 local function GetPlacedFolder(): Folder -- The folder is resolved through one function so placement code does not need to recreate or search for it repeatedly.
     local existing = workspace:FindFirstChild(PLACED_FOLDER_NAME) -- Reusing an existing folder prevents multiple controller starts from creating duplicate containers.
 
@@ -101,6 +104,7 @@ local function GetPlacedFolder(): Folder -- The folder is resolved through one f
     return folder -- The controller stores this reference so later placements do not need another hierarchy lookup.
 end
 
+-- Read the available block models fresh each time, so adding/removing a template while testing still works.
 local function GetBlockTemplates(): {Model} -- Template discovery is isolated here so selection logic only deals with valid Models.
     local templates: {Model} = {} -- Explicit typing keeps the returned collection compatible with strict Luau.
 
@@ -117,6 +121,7 @@ local function GetBlockTemplates(): {Model} -- Template discovery is isolated he
     return templates -- Returning a fresh list prevents callers from modifying the Blocks folder's actual children.
 end
 
+-- This is the bridge from the 2D mouse to the 3D world: screen position -> camera ray -> hit result.
 local function GetMouseHit( -- Converts 2D input into the 3D information required by the rest of the placement pipeline.
     camera: Camera?,
     params: RaycastParams
@@ -158,6 +163,7 @@ local function GetDominantNormalAxis( -- The surface normal determines which coo
     return "Z" -- Z is the remaining dominant axis.
 end
 
+-- Only the axes that are free to move get snapped. The axis touching the surface stays exact so the block does not float away.
 local function SnapPositionToGrid( -- Snapping is separated from raycasting so the placement math can change without changing input handling.
     position: Vector3,
     gridSize: number,
@@ -180,6 +186,7 @@ local function SnapPositionToGrid( -- Snapping is separated from raycasting so t
     return Vector3.new(x, y, z) -- Rebuilding the vector keeps the function pure and avoids mutating the input position.
 end
 
+-- A ray hits the surface, not the center of the block. This offset pushes the center outward by half the block depth.
 local function GetSurfaceOffset( -- Calculates the distance needed to move the model center from the hit surface to its outer face.
     normal: Vector3,
     worldSize: Vector3
@@ -191,6 +198,7 @@ local function GetSurfaceOffset( -- Calculates the distance needed to move the m
         + math.abs(normal.Z) * halfSize.Z -- The sum gives the distance from the center to the model's boundary along the normal.
 end
 
+-- After rotating a model, its world-aligned bounds can change. Collision checks need those rotated dimensions.
 local function GetRotatedWorldSize( -- Collision queries need world-aligned extents after rotation rather than the template's original dimensions.
     size: Vector3,
     rotation: CFrame
@@ -204,6 +212,7 @@ local function GetRotatedWorldSize( -- Collision queries need world-aligned exte
     )
 end
 
+-- The preview is deliberately harmless: it looks like the real block but should never affect physics or run scripts.
 local function PreparePreview(model: Model) -- The preview intentionally becomes a non-physical copy so visual feedback cannot affect gameplay.
     for _, object in model:GetDescendants() do -- Descendants are used because a Model may contain parts nested inside folders or other models.
         if object:IsA("BaseScript") or object:IsA("ModuleScript") then -- Scripts inside a cloned preview would otherwise duplicate behavior from the original template.
@@ -243,6 +252,7 @@ local function SetPreviewColor( -- Color is feedback for the collision result ra
     end
 end
 
+-- Delete mode starts from a hit part, then walks upward until it finds a tagged block owned by this player.
 local function FindPlacedModel( -- Deletion walks from the hit part to its model because the ray usually hits a BasePart, not the Model itself.
     instance: Instance?,
     expectedOwnerId: number
@@ -263,6 +273,7 @@ local function FindPlacedModel( -- Deletion walks from the hit part to its model
     return nil -- Returning nil prevents unrelated world objects from being treated as placed blocks.
 end
 
+-- The constructor sets up all state once, then starts the controller. After that, input and RenderStepped drive everything.
 function PlacementController.new(): PlacementControllerType -- Constructor keeps initial state in one place so every instance starts from a known configuration.
     local self = setmetatable({
         _gridIndex = 1, -- The first grid is selected because it provides the most precise default placement.
@@ -311,6 +322,7 @@ function PlacementController.new(): PlacementControllerType -- Constructor keeps
     return self -- Returning a fully initialized instance keeps construction and usage predictable.
 end
 
+-- Raycasts and overlap checks share the same ignore list, so the preview and the player's character cannot interfere.
 function PlacementController.UpdateFilters(self: PlacementControllerType) -- Filtering is centralized so raycast and collision rules stay synchronized.
     local filterObjects: {Instance} = {} -- Rebuild the list because the preview and character can change during runtime.
 
@@ -326,6 +338,7 @@ function PlacementController.UpdateFilters(self: PlacementControllerType) -- Fil
     self._overlapParams.FilterDescendantsInstances = filterObjects -- Collision checks must ignore the same temporary objects.
 end
 
+-- Two loops run the system: RenderStepped updates the preview every frame, while InputBegan handles controls.
 function PlacementController.Start(self: PlacementControllerType) -- Starts the controller's two main event-driven systems: input and frame updates.
     self._trove:Add(
         RunService.RenderStepped:Connect(function(deltaTime) -- RenderStepped is appropriate because interpolation is presentation work rather than simulation state.
@@ -359,6 +372,7 @@ function PlacementController.Start(self: PlacementControllerType) -- Starts the 
     self:UpdateFilters() -- The initial filter must be valid before the first RenderStepped callback runs.
 end
 
+-- Keep keyboard/mouse handling in one place. The actual work stays in separate methods so this function remains easy to follow.
 function PlacementController.ProcessInput( -- Input is converted into state changes here instead of being mixed into placement calculations.
     self: PlacementControllerType,
     input: InputObject
@@ -423,6 +437,7 @@ function PlacementController.CycleBlock(self: PlacementControllerType) -- Advanc
     self:SelectBlock(blocks[self._blockIndex]) -- Replace the current preview with the new template.
 end
 
+-- Selecting a block resets the temporary state first, then caches the template's size/pivot information.
 function PlacementController.SelectBlock( -- Extracts all physical information needed before preview movement begins.
     self: PlacementControllerType,
     blockTemplate: Model
@@ -453,6 +468,7 @@ function PlacementController.ToggleDeleteMode(self: PlacementControllerType) -- 
     self._deleting = newDeleteState -- Restore only the requested delete state after the reset.
 end
 
+-- Rebuild the preview from the original template instead of modifying the template itself.
 function PlacementController.CreatePreview( -- Creates the temporary object used solely for visual feedback.
     self: PlacementControllerType,
     blockTemplate: Model
@@ -495,6 +511,7 @@ function PlacementController.CanPlace(self: PlacementControllerType): boolean --
         and self._blockSize ~= nil
 end
 
+-- The collision test checks the exact target CFrame, not the smoothed visual preview.
 function PlacementController.CheckCollisions( -- Collision validation is separated so the same target calculation can be tested independently of visual movement.
     self: PlacementControllerType,
     cframe: CFrame,
@@ -521,6 +538,7 @@ function PlacementController.CheckCollisions( -- Collision validation is separat
     return true -- No relevant collision means the target is currently valid.
 end
 
+-- This is the core placement calculation: rotated size -> surface offset -> grid snap -> final CFrame.
 function PlacementController.ComputeTargetCFrame( -- This function is the mathematical center of the placement system.
     self: PlacementControllerType,
     result: RaycastResult
@@ -559,6 +577,7 @@ function PlacementController.ComputeTargetCFrame( -- This function is the mathem
     return targetCFrame, worldSize -- Both values are needed by the next stages: visual movement and collision validation.
 end
 
+-- The preview can move smoothly for nicer visuals, but this smoothing never changes the real placement target.
 function PlacementController.UpdatePreviewTransform( -- Separating visual interpolation from target calculation keeps placement mathematically exact.
     self: PlacementControllerType,
     targetCFrame: CFrame,
@@ -611,6 +630,7 @@ function PlacementController.UpdatePreviewTransform( -- Separating visual interp
     )
 end
 
+-- Delete mode reuses the same mouse ray, but converts the hit into a valid owned model and highlights it.
 function PlacementController.UpdateDeleteMode(self: PlacementControllerType) -- Delete mode reuses the same raycasting system but changes the result into a selectable target.
     local highlight = self._deleteHighlight -- Reuse the persistent Highlight instead of creating one for every target.
 
@@ -636,6 +656,7 @@ function PlacementController.UpdateDeleteMode(self: PlacementControllerType) -- 
     end
 end
 
+-- Main per-frame flow: find the surface, calculate the target, move the preview, then validate the target.
 function PlacementController.Update( -- This is the main coordinator that connects input state, raycasting, math, collision, and visuals.
     self: PlacementControllerType,
     deltaTime: number
@@ -696,6 +717,7 @@ function PlacementController.Update( -- This is the main coordinator that connec
     end
 end
 
+-- When the latest target is valid, clone the original template and place it using the exact target transform.
 function PlacementController.Place(self: PlacementControllerType) -- Commits the previously calculated target into a real model.
     if not self:CanPlace() or not self._canPlace then -- Placement is gated by both valid controller state and the latest collision result.
         return
@@ -738,6 +760,7 @@ function PlacementController.Place(self: PlacementControllerType) -- Commits the
     placedModel.Parent = placedFolder -- Parenting last prevents other systems from observing an incompletely configured object.
 end
 
+-- Re-check the raycast at click time so deletion never trusts an old highlight.
 function PlacementController.Delete(self: PlacementControllerType) -- Deletes only a model that passed the same ownership rules used for highlighting.
     if not self._deleting then -- This guard prevents other input paths from accidentally deleting during normal building.
         return
@@ -769,6 +792,7 @@ function PlacementController.Delete(self: PlacementControllerType) -- Deletes on
     end
 end
 
+-- Cancel clears temporary building/deleting state but keeps the controller itself alive for later use.
 function PlacementController.Cancel(self: PlacementControllerType) -- Resets temporary state without destroying the controller itself.
     self._placing = false -- Stop the building update path.
     self._canPlace = false -- Invalidate any previous collision result.
@@ -794,11 +818,13 @@ function PlacementController.Cancel(self: PlacementControllerType) -- Resets tem
     end
 end
 
+-- Final cleanup: remove temporary state and disconnect/destroy everything owned by the controller.
 function PlacementController.Destroy(self: PlacementControllerType) -- Provides a complete lifecycle endpoint for the controller.
     self:Cancel() -- Temporary state is cleaned before permanent resources are removed.
     self._trove:Destroy() -- Trove disconnects registered events and destroys tracked instances, preventing event/instance leaks.
 end
 
+-- Create the controller once when this module/script is loaded.
 local controller = PlacementController.new() -- Construction initializes state, creates the highlight, and connects the controller to Roblox events.
 
 return controller -- Returning the instance allows another client script to retain or control the initialized system.
